@@ -1,4 +1,24 @@
-node --version
-npm install -g @google/gemini-cli
-gemini
+#!/bin/bash
+# Quick helper script for this codespace.
+# Usage:
+#   ./codespace1           # if made executable
+#   bash codespace1        # run explicitly
 
+set -euo pipefail
+
+echo "Checking Node.js..."
+if command -v node >/dev/null 2>&1; then
+  node --version
+else
+  echo "node not found — please install Node.js if you need it"
+fi
+
+echo "Installing Gemini CLI (global npm package)..."
+npm install -g @google/gemini-cli || echo "npm install failed or not needed"
+
+echo "Attempting to run multi_agent_runner.py if present..."
+if [ -f "multi_agent_runner.py" ]; then
+  python3 multi_agent_runner.py
+else
+  echo "multi_agent_runner.py not found. Create it or run manually."
+fi

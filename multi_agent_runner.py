@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Simple, robust multi-agent runner
+
+Features implemented:
+- Load optional YAML/JSON config with agent definitions
+- Support two agent types: "noop" and "shell"
+- Run agents concurrently using ThreadPoolExecutor
+- Retry, timeout, and structured logging to stdout
+- Graceful shutdown on KeyboardInterrupt / SIGTERM
+
+Design goals: minimal dependencies (stdlib-first), clear errors,
+small interface, and easy extensibility.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import signal
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+# YAML support is optional; if PyYAML is available we'll use it for .yaml files
+try:
+    import yaml  # type: ignore
+    _HAS_YAML = True
+except Exception:
+    _HAS_YAML = False
+
+LOG = logging.getLogger("multi_agent_runner")
+
+
+@dataclass
+class AgentSpec:
+    name: str
+    type: str
+    cmd: Optional[str] = None
+    retries: int = 0
+    timeout: Optional[float] = None
+
+
+class Runner:
+    def __init__(self, agents: List[AgentSpec], max_workers: int = 4) -> None:
+        self.agents = agents
+        self.max_workers = max_workers
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        LOG.info("Stop requested")
+        self._stop.set()
+
+    def run_agent(self, spec: AgentSpec) -> Dict[str, Any]:
+        LOG.info("Starting agent %s (type=%s)", spec.name, spec.type)
+        attempt = 0
+        last_exc: Optional[Exception] = None
+        while attempt <= spec.retries and not self._stop.is_set():
+            attempt += 1
+            start = time.time()
+            try:
+                if spec.type == "noop":
+                    LOG.debug("Agent %s noop (attempt %d)", spec.name, attempt)
+                    # quick deterministic sleep to simulate work
+                    time.sleep(0.01)
+                    return {"name": spec.name, "status": "ok", "attempts": attempt}
+
+                elif spec.type == "shell":
+                    if not spec.cmd:
+                        raise ValueError("shell agent requires 'cmd'")
+                    LOG.info("Agent %s running shell: %s", spec.name, spec.cmd)
+                    # Run shell command; use subprocess to capture output.
+                    proc = subprocess.Popen(spec.cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    try:
+                        out, err = proc.communicate(timeout=spec.timeout)
+                        rc = proc.returncode
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        out, err = proc.communicate()
+                        rc = -1
+                        raise TimeoutError(f"agent {spec.name} timed out")
+
+                    if rc != 0:
+                        stderr = err.decode(errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
+                        raise RuntimeError(f"agent {spec.name} failed rc={rc} err={stderr}")
+
+                    duration = time.time() - start
+                    stdout_text = out.decode(errors="ignore") if isinstance(out, (bytes, bytearray)) else str(out)
+                    LOG.debug("Agent %s stdout: %s", spec.name, stdout_text)
+                    LOG.info("Agent %s succeeded in %.3fs", spec.name, duration)
+                    return {"name": spec.name, "status": "ok", "attempts": attempt, "duration": duration}
+
+                else:
+                    raise ValueError(f"unsupported agent type: {spec.type}")
+
+            except Exception as exc:  # capture any failure to allow retries
+                last_exc = exc
+                LOG.warning("Agent %s attempt %d failed: %s", spec.name, attempt, exc)
+                if attempt > spec.retries:
+                    break
+                LOG.info("Retrying agent %s (next attempt %d/%d)", spec.name, attempt + 1, spec.retries + 1)
+                # small backoff
+                time.sleep(0.05)
+
+        return {"name": spec.name, "status": "failed", "error": str(last_exc), "attempts": attempt}
+
+    def run(self) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        LOG.info("Running %d agents with up to %d workers", len(self.agents), self.max_workers)
+        if not self.agents:
+            LOG.info("No agents to run")
+            return results
+
+        max_workers = min(self.max_workers, max(1, len(self.agents)))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(self.run_agent, a): a for a in self.agents}
+            try:
+                for fut in as_completed(futures):
+                    try:
+                        res = fut.result()
+                    except Exception as exc:
+                        LOG.exception("Unhandled exception in agent future: %s", exc)
+                        res = {"name": "unknown", "status": "failed", "error": str(exc)}
+                    LOG.info("Agent result: %s", res)
+                    results.append(res)
+                    if self._stop.is_set():
+                        LOG.info("Stop flag set; breaking out of result loop")
+                        break
+            except KeyboardInterrupt:
+                LOG.info("KeyboardInterrupt received; requesting stop")
+                self.stop()
+        return results
+
+
+def load_config(path: Optional[Path]) -> List[AgentSpec]:
+    if not path:
+        LOG.info("No config provided; using two default noop agents for demo")
+        return [AgentSpec(name="demo-noop-1", type="noop"), AgentSpec(name="demo-noop-2", type="noop")]
+
+    if not path.exists():
+        raise FileNotFoundError(f"config not found: {path}")
+
+    text = path.read_text()
+    data: Any
+    if path.suffix in (".yaml", ".yml"):
+        if not _HAS_YAML:
+            raise RuntimeError("PyYAML required to load YAML config. Install it or provide JSON config.")
+        data = yaml.safe_load(text)
+    else:
+        data = json.loads(text)
+
+    agents: List[AgentSpec] = []
+    for entry in data.get("agents", []):
+        agents.append(AgentSpec(
+            name=entry.get("name") or entry.get("id") or "agent",
+            type=entry.get("type", "noop"),
+            cmd=entry.get("cmd"),
+            retries=int(entry.get("retries", 0)),
+            timeout=(float(entry.get("timeout")) if entry.get("timeout") is not None else None),
+        ))
+    return agents
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Simple multi-agent runner (demo)")
+    p.add_argument("--config", "-c", type=Path, help="JSON/YAML config file with agents")
+    p.add_argument("--workers", "-w", type=int, default=4, help="Max concurrent agents")
+    p.add_argument("--json", dest="json_out", action="store_true", help="Print results as JSON")
+    return p.parse_args(argv)
+
+
+def _setup_logging() -> None:
+    h = logging.StreamHandler()
+    fmt = "%(asctime)s %(levelname)s %(message)s"
+    h.setFormatter(logging.Formatter(fmt))
+    LOG.addHandler(h)
+    LOG.setLevel(logging.INFO)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    _setup_logging()
+    args = parse_args(argv)
+    try:
+        agents = load_config(args.config) if args.config else load_config(None)
+    except Exception as e:
+        LOG.error("Failed to load config: %s", e)
+        return 2
+
+    runner = Runner(agents, max_workers=args.workers)
+
+    def _handle_sig(sig, frame):
+        LOG.info("Signal %s received: requesting stop", sig)
+        runner.stop()
+
+    signal.signal(signal.SIGINT, _handle_sig)
+    signal.signal(signal.SIGTERM, _handle_sig)
+
+    results = runner.run()
+    if args.json_out:
+        print(json.dumps(results))
+    else:
+        LOG.info("Run finished. Results: %s", results)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

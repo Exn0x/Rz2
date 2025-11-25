@@ -1,0 +1,30 @@
+{
+  "agents": [
+    {
+      "name": "check-python",
+      "type": "shell",
+      "cmd": "python3 --version",
+      "timeout": 5,
+      "retries": 0
+    },
+    {
+      "name": "list-root",
+      "type": "shell",
+      "cmd": "ls -la /workspaces/Rz2 | head -10",
+      "timeout": 5,
+      "retries": 0
+    },
+    {
+      "name": "get-date",
+      "type": "shell",
+      "cmd": "date",
+      "timeout": 5,
+      "retries": 1
+    },
+    {
+      "name": "demo-noop",
+      "type": "noop",
+      "retries": 0
+    }
+  ]
+}
