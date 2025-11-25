@@ -1,118 +1,211 @@
-<html>
-    <head>
+#!/usr/bin/env python3
+"""Simple, robust multi-agent runner
 
-    <style>
-        body {
-          font-size: 14px;
-          font-family: 'Avenir Next','Helvetica Neue', Arial, Helvetica, sans-serif;
-          margin: 20px auto;
-          width: 1200px;
-        }
-        b {
-          font-weight: 600;
-        }
-        h1 {
-          color: #49C88B;
-          line-height: 40px;
-        }
-        li {
-          list-style-type: none;
-        }
+Features implemented:
+- Load optional YAML/JSON config with agent definitions
+- Support two agent types: "noop" and "shell"
+- Run agents concurrently using ThreadPoolExecutor
+- Retry, timeout, and structured logging to stdout
+- Graceful shutdown on KeyboardInterrupt / SIGTERM
 
-        .bitmoji-logo {
-          height: 40px;
-          width: 40px;
-          padding: 0 10px 0 0;
-          vertical-align: middle;
-        }
+Design goals: minimal dependencies (stdlib-first), clear errors,
+small interface, and easy extensibility.
+"""
+from __future__ import annotations
 
-        .title {
-          display: inline-block;
-          vertical-align: middle;
-        }
-    </style>
-  </head>
+import argparse
+import json
+import logging
+import signal
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-  <body>
+# YAML support is optional; if PyYAML is available we'll use it for .yaml files
+try:
+    import yaml  # type: ignore
+    _HAS_YAML = True
+except Exception:
+    _HAS_YAML = False
 
-    <h1><img class='bitmoji-logo' src='data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPHN2ZyB3aWR0aD0iMTAyNHB4IiBoZWlnaHQ9IjEwMjRweCIgdmlld0JveD0iMCAwIDEwMjQgMTAyNCIgdmVyc2lvbj0iMS4xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIj4KICAgIDwhLS0gR2VuZXJhdG9yOiBTa2V0Y2ggNDQuMSAoNDE0NTUpIC0gaHR0cDovL3d3dy5ib2hlbWlhbmNvZGluZy5jb20vc2tldGNoIC0tPgogICAgPHRpdGxlPkJpdG1vamkgQXBwIEljb248L3RpdGxlPgogICAgPGRlc2M+Q3JlYXRlZCB3aXRoIFNrZXRjaC48L2Rlc2M+CiAgICA8ZGVmcz4KICAgICAgICA8cGF0aCBkPSJNMS4wOTk1NTcyOCw3NjMuNTY3OTY5IEwxLjA5OTU1NzI4LDc2My42MTM3MDEgQzEuNzExOTY4OTMsNzg2LjMyODYwNiAxLjkwMDg2MjE0LDgwOS4xNzQ3NDIgNS43MzI0MTE2NSw4MzEuNzUwNDYyIEM5Ljc5MjYyMTM2LDg1NS42MzQ1MTcgMTUuNTk2NjEzNiw4NzguOTI0MDU0IDI2LjY2OTczMiw5MDAuNjAxMDQxIEM0MS42NDAwMTU1LDkyOS45NDExMjYgNjIuMTk5NTQ5NSw5NTQuNzE3OTUgODguMTUxNDg3NCw5NzQuOTU3MzU5IEMxMDYuNzg0MzExLDk4OS40OTAyMDYgMTI3LjEzOTA0NSwxMDAxLjAyNjYxIDE0OS42NzEwMjEsMTAwOC4zMDM5NyBDMTgyLjUyNjUwOSwxMDE4LjkwMTg3IDIxNi40MjE5MDMsMTAyMi45NjQwNyAyNTAuODEyMzk2LDEwMjMuMTYyOSBDMjcyLjI2ODY3NiwxMDIzLjI5ODExIDI5My43MTEwMzcsMTAyMy44MzQ5NyAzMTUuMTc1MjcsMTAyMy43NDU0OSBDNDcxLjA1MTkzLDEwMjMuMDg5MzQgNjI2LjkzMjU2NywxMDI0Ljg3MDkgNzgyLjgxMzIwNCwxMDIyLjc4MzEzIEM4MDMuNDk4MDA0LDEwMjIuNTAyNzcgODIzLjg0NDc4NCwxMDE5Ljk3OTU2IDg0NC4xNDU4MzMsMTAxNi4yNjczMSBDODgzLjA1NTg0NSwxMDA5LjE0NTA0IDkxNy40NDQzNSw5OTIuNTQyMzIyIDk0Ni44NjU5NTcsOTY2LjI5NDEyIEM5ODEuMTU1MDQ1LDkzNS43MTEzMTcgMTAwNC4yODk0OSw4OTguMjgyNjI1IDEwMTQuNzMyMyw4NTMuMTA5MzEzIEMxMDIxLjU2NjI2LDgyMy41ODIzMjIgMTAyMy4yNzYyNCw3OTMuNjI1ODQ5IDEwMjMuNTY4NTMsNzYzLjU2Mzk5MiBMMTAyMy41Njg1Myw3NTcuNTY3MTMgQzEwMjMuNTY4NTMsNzU1LjI0MDc2MSAxMDIyLjY4MzcxLDI0Ni43NzYwNDcgMTAyMi42MDIxOSwyNDAuMDU1NDI1IEMxMDIyLjM3MzUzLDIyMS41OTM2IDEwMjEuMDEzNSwyMDMuMjcwOTU5IDEwMTcuNTUxNzgsMTg1LjEwNTM5OCBDMTAxMy4zNDI0NSwxNjIuOTY5MTAzIDEwMDcuMzk1MjksMTQxLjM5OTQ4NyA5OTYuNzk1NDAyLDEyMS4zNzI4MzEgQzk4NS42MDI5ODMsMTAwLjIxNDgwNCA5NzEuNTgzMTMsODEuMTkwMjc1NyA5NTQuMjQyNzM0LDY0LjU2NTY4NTQgQzkyNy42ODAzNzMsMzkuMDk0OTI4MiA4OTcuMDI3OTc3LDIxLjA4MjQ2OTkgODYxLjM0MzA2OCwxMS41NTQyOTkgQzgyOS4xMTE5MjIsMi45NTA3MTA2OCA3OTYuMjMwNTg2LDEuMDQ1ODcxODQgNzYzLjEwODY2LDEuMDc1Njk3MDkgQzc2My4wNTQ5NzUsMS4wNjc3NDM2OSA3NjIuOTI5NzA5LDAuNzMxNzEyNjIxIDc2Mi45MjE3NTUsMC41Njg2Njc5NjEgTDI2MS41ODcyNjIsMC41Njg2Njc5NjEgQzI2MS41NzczMiwwLjczOTY2NjAxOSAyNjEuNTcxMzU1LDAuOTEwNjY0MDc4IDI2MS41NTk0MjUsMS4wNzU2OTcwOSBDMjQyLjc2MTU2OSwxLjQxOTY4MTU1IDIyMy45MzU4NzYsMS4yNzg1MDg3NCAyMDUuMjMzNDYsMy41OTY5MjQyNyBDMTg0Ljc0NTUwNyw2LjE0NCAxNjQuNDU0NCw5Ljk3OTUyNjIxIDE0NS4wNjIwMjcsMTcuMTQxNTYxMiBDMTE0LjUxNzAwMiwyOC40MzkzNjMxIDg3Ljk3ODUwMSw0Ni4wMzYyNTYzIDY1LjMwOTMyODIsNjkuNTI4NjA1OCBDMzkuNjI1ODE3NSw5Ni4xNDQ2NTI0IDIxLjUyMTg5NTEsMTI2LjkyNjI5MSAxMS45MTYxNzg2LDE2Mi43NzAyNjggQzMuMzQ2MzkyMjMsMTk0Ljc1MDg4MiAxLjQ4MTMyMDM5LDIyNy4zNjc3NjcgMS40MzU1ODgzNSwyNjAuMjE1MzAxIiBpZD0icGF0aC0xIj48L3BhdGg+CiAgICA8L2RlZnM+CiAgICA8ZyBpZD0iUGFnZS0xIiBzdHJva2U9Im5vbmUiIHN0cm9rZS13aWR0aD0iMSIgZmlsbD0ibm9uZSIgZmlsbC1ydWxlPSJldmVub2RkIj4KICAgICAgICA8ZyBpZD0iQml0bW9qaS1BcHAtSWNvbiI+CiAgICAgICAgICAgIDxtYXNrIGlkPSJtYXNrLTIiIGZpbGw9IndoaXRlIj4KICAgICAgICAgICAgICAgIDx1c2UgeGxpbms6aHJlZj0iI3BhdGgtMSI+PC91c2U+CiAgICAgICAgICAgIDwvbWFzaz4KICAgICAgICAgICAgPHVzZSBpZD0iUm91bmRlZC1SZWN0YW5nbGUiIGZpbGw9IiM0MkM5OTAiIGZpbGwtcnVsZT0ibm9uemVybyIgeGxpbms6aHJlZj0iI3BhdGgtMSI+PC91c2U+CiAgICAgICAgICAgIDxwb2x5Z29uIGlkPSJSZWQiIGZpbGw9IiNFNTRFNDIiIG1hc2s9InVybCgjbWFzay0yKSIgcG9pbnRzPSI1NzUgODU1IDEwODcgODU1IDk1MyAxMDI0IDU3NSAxMDI0Ij48L3BvbHlnb24+CiAgICAgICAgICAgIDxwb2x5Z29uIGlkPSJZZWxsb3ciIGZpbGw9IiNGREQwMkYiIG1hc2s9InVybCgjbWFzay0yKSIgcG9pbnRzPSIyODggODU1IDgwMCA4NTUgNjY2IDEwMjQgMjg4IDEwMjQiPjwvcG9seWdvbj4KICAgICAgICAgICAgPHBvbHlnb24gaWQ9IkdyZWVuIiBmaWxsPSIjMzlDQTc0IiBtYXNrPSJ1cmwoI21hc2stMikiIHBvaW50cz0iMzAgODU1IDU0MiA4NTUgNDA4IDEwMjQgMzAgMTAyNCI+PC9wb2x5Z29uPgogICAgICAgICAgICA8cG9seWdvbiBpZD0iQmx1ZSIgZmlsbD0iIzQ1QTJFMCIgbWFzaz0idXJsKCNtYXNrLTIpIiBwb2ludHM9Ii0yMTIgODU1IDMwMCA4NTUgMTY2IDEwMjQgLTIxMiAxMDI0Ij48L3BvbHlnb24+CiAgICAgICAgICAgIDxwYXRoIGQ9Ik02ODcuNzU2MjA0LDQ2OS40NDI5MTEgTDMzNy4yNDUyNTUsNDY5LjQ0MjkxMSBDMzMyLjI3NDAwOSw0NjkuNDQyOTExIDMzMi4yMzc5NTYsNDc1LjQ1MDQzOSAzMzIuMjM3OTU2LDQ3NS40NTA0MzkgQzMzMi4yMzc5NTYsNTgwLjUxNDA5OCA0MDcuNDE1NTQ1LDY2NS42ODg4MzMgNTEyLjUwMDczLDY2NS42ODg4MzMgQzYxNy41ODU5MTUsNjY1LjY4ODgzMyA2OTIuNzYzNTA0LDU4MC41MTQwOTggNjkyLjc2MzUwNCw0NzUuNDUwNDM5IEM2OTIuNzYzNTA0LDQ3NS40NTA0MzkgNjkyLjczOTQ2OSw0NjkuNDQyOTExIDY4Ny43NTYyMDQsNDY5LjQ0MjkxMSBMNjg3Ljc1NjIwNCw0NjkuNDQyOTExIFogTTYxMi42NDY3MTUsMjc0LjE5ODI0MyBDNTgxLjY3MzU2NSwyNzQuMTk4MjQzIDU1Ni41NjQ5NjQsMzAxLjU3MjU0NyA1NTYuNTY0OTY0LDM0MC4yODEwNTQgQzU1Ni41NjQ5NjQsMzc4Ljk4OTU2MSA1ODEuNjczNTY1LDQwNi4zNjM4NjQgNjEyLjY0NjcxNSw0MDYuMzYzODY0IEM2NDMuNjE5ODY2LDQwNi4zNjM4NjQgNjY4LjcyODQ2NywzNzguOTg5NTYxIDY2OC43Mjg0NjcsMzQwLjI4MTA1NCBDNjY4LjcyODQ2NywzMDEuNTcyNTQ3IDY0My42MTk4NjYsMjc0LjE5ODI0MyA2MTIuNjQ2NzE1LDI3NC4xOTgyNDMgTDYxMi42NDY3MTUsMjc0LjE5ODI0MyBaIE00NjcuNDM1MDM2LDM3Mi4zMjEyMDUgQzQ2Ny40MzUwMzYsMzMzLjYxMjY5OCA0NDIuMzI2NDM1LDMwMi4yMzMzNzUgNDExLjM1MzI4NSwzMDIuMjMzMzc1IEMzODAuMzgwMTM0LDMwMi4yMzMzNzUgMzU1LjI3MTUzMywzMzMuNjEyNjk4IDM1NS4yNzE1MzMsMzcyLjMyMTIwNSBMMzU1LjI3MTUzMywzNzQuMzIzNzE0IEMzNTUuMjcxNTMzLDM3NC4zMjM3MTQgMzU2LjY0OTU0MiwzNzkuNDE4MDk4IDM1OS4xMDExMTUsMzc4LjAwNDMyNiBDMzY3LjU0OTQzMSwzNzMuMTM4MjI4IDM4OC43NDQzMjcsMzY0LjMxMTE2NyA0MTAuMTY3NTU2LDM2NC4zMTExNjcgQzQzMi4zOTk5NjUsMzY0LjMxMTE2NyA0NTQuODg0NzQyLDM3My4zMzA0NjkgNDYzLjYyOTQ4OSwzNzguMTM2NDkyIEM0NjYuMDY1MDM5LDM3OS40NzQxNjggNDY3LjQzNTAzNiwzNzQuMzIzNzE0IDQ2Ny40MzUwMzYsMzc0LjMyMzcxNCBMNDY3LjQzNTAzNiwzNzIuMzIxMjA1IFogTTgwOS4yMDkyNSw3NDkuNTc3OTU3IEM3OTQuNTY3OTA3LDc1OC41OTcyNiA3NzcuMzIyNzY4LDc2My44MTE3OTQgNzU4Ljg1OTg1NCw3NjMuODExNzk0IEw2MjkuODM5Nzc4LDc2NC43OTcwMjkgQzYyOS43NzU2ODUsNzY0Ljc5NzAyOSA2MzcuNzM1Mjg4LDc2NC44MDUwMzkgNjM3LjY3MTE5NCw3NjQuODA1MDM5IEM2MDUuNDA4MTY0LDc2NC44MDUwMzkgNTkxLjM1NTY3OSw3NzMuMTY3NTE4IDU3OC44MDEzNzgsNzg3LjE0OTAzOSBMNDc5LjQ1MjU1NSw5MTQgTDQ3OS40NTI1NTUsNzg5Ljg0NDQxNyBDNDc5LjM0ODQwMyw3NzIuNzk5MDU2IDQ2Ny41MTkxNTksNzY0LjgzMzA3NCA0NTAuNTM4NDA2LDc2NC43OTcwMjkgTDI2NC4xMzg2ODYsNzY0LjgxMzA0OSBDMjExLjYyMjEzMSw3NjQuODEzMDQ5IDE2OSw3MjIuMTk5NjQ5IDE2OSw2NjkuNjkzODUyIEwxNjksMjEyLjEyMDQ1MiBDMTY5LDIxMC4zOTQyODkgMTY5LjA1MjA3NiwyMDguNjgwMTQxIDE2OS4xNDAyMDQsMjA2Ljk3NDAwMyBDMTcxLjE1OTE0NywxNTYuMjYyNDU0IDIxMi45MDgwMDYsMTE2IDI2NC4xMzg2ODYsMTE2IEw3NTguODU5ODU0LDExNiBDODExLjk1NzI1NSwxMTYgODU1LDE1OS4wMzM5MjcgODU1LDIxMi4xMjA0NTIgTDg1NSw2NjkuNjkzODUyIEM4NTUsNzA0LjE1NzAzOSA4MzYuNjYxMjY3LDczMy40ODk3OTcgODA5LjIwOTI1LDc0OS41Nzc5NTcgTDgwOS4yMDkyNSw3NDkuNTc3OTU3IFoiIGlkPSJCaXRtb2ppLUljb24iIGZpbGw9IiNGRkZGRkYiIG1hc2s9InVybCgjbWFzay0yKSI+PC9wYXRoPgogICAgICAgIDwvZz4KICAgIDwvZz4KPC9zdmc+'/>
-      <span class='title'>Your Bitmoji User Data</span>
-    </h1>
-
-      <h2> Account Data </h2>
-      <div>
-        <ul>
-          <li><b>Email: </b>iznulhaq@gmail.com (verified)</li>
-          <li><b>Phone Number: </b></li>
-          <li><b>Account creation date: </b>Wednesday, March 13 2024, 08:29:02</li>
-        </ul>
-      </div>
-
-      <h2> Analytics </h2>
-      <div>
-        <ul>
-          <li><b>Avatar gender: </b>male</li>
-          <li><b>App open count: </b>5</li>
-          <li><b>Share count: </b>3</li>
-          <li><b>Outfit save count: </b>1</li>
-        </ul>
-
-      <h2> Keyboard Enable Full Access History (iOS only) </h2>
-      <div>
-        <ul>
-        </ul>
-      </div>
-
-        <h2> Search Terms </h2>
-        <div>
-            <b>Wed Oct 01 2025</b>
-            <ul>
-                <li> Birthday</li>
-            </ul>
-        </div>
-
-      <h2> Support Cases </h2>
-      <div>
-      </div>
-
-      <h2> Terms of Use and Privacy Policy </h2>
-      <div>
-          <div><b>Effective Date/Name:</b> Bitmoji Privacy Policy &amp; Terms of Service - August 30, 2021</div>
-          <div><b>Accepted on:</b> Sunday, May 26 2024, 14:32:53</div>
-          <br>
-      </div>
+LOG = logging.getLogger("multi_agent_runner")
 
 
-      <h2> Mirror Selfie History </h2>
-      <p> These are the selfies you took while building your avatar, which we use to help design your avatar and improve Bitmoji. You can delete these selfies by clicking "Clear History" in the Bitmoji settings. </p>
-      <div>
-      </div>
+@dataclass
+class AgentSpec:
+    name: str
+    type: str
+    cmd: Optional[str] = None
+    retries: int = 0
+    timeout: Optional[float] = None
 
 
-      <h1> Frequently Asked Questions </h1>
-      <div>
-        <h3> What information is available when I request my data? </h3>
-        <p>In this file, you will find your basic account information, search history, selfie history, support communications, and other information. <a href="https://support.bitmoji.com/">Contact us</a> if you have any questions.</p>
+class Runner:
+    def __init__(self, agents: List[AgentSpec], max_workers: int = 4) -> None:
+        self.agents = agents
+        self.max_workers = max_workers
+        self._stop = threading.Event()
 
-        <h3>What if I think some information is missing?</h3>
-        <p>We try to make sure your newest information is provided, but sometimes there's a delay before we can include it. If you think some information is missing, try downloading your data again in a day or two. If you still don't see it, <a href="https://support.bitmoji.com/">contact us</a>!</p>
+    def stop(self) -> None:
+        LOG.info("Stop requested")
+        self._stop.set()
 
-        <h3>What other information can I access?</h3>
-        <p>In addition to the information available here, Bitmoji also retains logs of activities on our services, like when you click on a trait in the avatar builder or save an outfit. We use these logs to understand how our services are being used so we can provide and improve our apps, report aggregate metrics, and improve the security of our services.</p>
+    def run_agent(self, spec: AgentSpec) -> Dict[str, Any]:
+        LOG.info("Starting agent %s (type=%s)", spec.name, spec.type)
+        attempt = 0
+        last_exc: Optional[Exception] = None
+        while attempt <= spec.retries and not self._stop.is_set():
+            attempt += 1
+            start = time.time()
+            try:
+                if spec.type == "noop":
+                    LOG.debug("Agent %s noop (attempt %d)", spec.name, attempt)
+                    # quick deterministic sleep to simulate work
+                    time.sleep(0.01)
+                    return {"name": spec.name, "status": "ok", "attempts": attempt}
 
-        <p>Typically, logs are retained for 180 days but, in some cases, we may need to retain these logs for much longer. For example, we may need to store some logs for the lifetime of your account.
-        We provide counts of the most important activity logs here, like the number of times you've opened Bitmoji and the number of Bitmoji stickers  you've sent. The actual logs are stored pseudonymously and we are unable to associate them with individual users without significant burden.</p>
+                elif spec.type == "shell":
+                    if not spec.cmd:
+                        raise ValueError("shell agent requires 'cmd'")
+                    LOG.info("Agent %s running shell: %s", spec.name, spec.cmd)
+                    # Run shell command; use subprocess to capture output.
+                    proc = subprocess.Popen(spec.cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    try:
+                        out, err = proc.communicate(timeout=spec.timeout)
+                        rc = proc.returncode
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        out, err = proc.communicate()
+                        rc = -1
+                        raise TimeoutError(f"agent {spec.name} timed out")
 
-        <h3>How can I control my information?</h3>
-        <p>We want you to feel in control when it comes to how we collect and process your data. To help, we provide a number of options - like <a href="https://support.bitmoji.com/hc/en-us/articles/360001494126-Clear-My-History">clearing your history</a> or <a href="https://support.bitmoji.com/hc/en-us/articles/360001494146-Delete-My-Account">deleting your account</a> - right in our app!</p>
+                    if rc != 0:
+                        stderr = err.decode(errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
+                        raise RuntimeError(f"agent {spec.name} failed rc={rc} err={stderr}")
 
-        <h3>How is my information shared?</h3>
-        <p>When we share information, it's usually because you ask us to or because we need to share your information to provide our services or comply with the law. You can <a href="https://www.snap.com/privacy/privacy-policy#how-we-share-information">learn more</a> in our Privacy Policy.</p>
+                    duration = time.time() - start
+                    stdout_text = out.decode(errors="ignore") if isinstance(out, (bytes, bytearray)) else str(out)
+                    LOG.debug("Agent %s stdout: %s", spec.name, stdout_text)
+                    LOG.info("Agent %s succeeded in %.3fs", spec.name, duration)
+                    return {"name": spec.name, "status": "ok", "attempts": attempt, "duration": duration}
 
-        <h3>I have another privacy question.</h3>
-        <p>We'd love to provide an answer! Head to our <a href="https://www.snap.com/en-US/privacy/privacy-policy">Privacy Policy</a>, or <a href="https://support.bitmoji.com/hc/en-us/requests/new?ticket_form_id=360000352432">reach out</a> to us.</p>
-      </div>
+                else:
+                    raise ValueError(f"unsupported agent type: {spec.type}")
 
-    </div>
-  </body>
-</html>
+            except Exception as exc:  # capture any failure to allow retries
+                last_exc = exc
+                LOG.warning("Agent %s attempt %d failed: %s", spec.name, attempt, exc)
+                if attempt > spec.retries:
+                    break
+                LOG.info("Retrying agent %s (next attempt %d/%d)", spec.name, attempt + 1, spec.retries + 1)
+                # small backoff
+                time.sleep(0.05)
+
+        return {"name": spec.name, "status": "failed", "error": str(last_exc), "attempts": attempt}
+
+    def run(self) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        LOG.info("Running %d agents with up to %d workers", len(self.agents), self.max_workers)
+        if not self.agents:
+            LOG.info("No agents to run")
+            return results
+
+        max_workers = min(self.max_workers, max(1, len(self.agents)))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(self.run_agent, a): a for a in self.agents}
+            try:
+                for fut in as_completed(futures):
+                    try:
+                        res = fut.result()
+                    except Exception as exc:
+                        LOG.exception("Unhandled exception in agent future: %s", exc)
+                        res = {"name": "unknown", "status": "failed", "error": str(exc)}
+                    LOG.info("Agent result: %s", res)
+                    results.append(res)
+                    if self._stop.is_set():
+                        LOG.info("Stop flag set; breaking out of result loop")
+                        break
+            except KeyboardInterrupt:
+                LOG.info("KeyboardInterrupt received; requesting stop")
+                self.stop()
+        return results
+
+
+def load_config(path: Optional[Path]) -> List[AgentSpec]:
+    if not path:
+        LOG.info("No config provided; using two default noop agents for demo")
+        return [AgentSpec(name="demo-noop-1", type="noop"), AgentSpec(name="demo-noop-2", type="noop")]
+
+    if not path.exists():
+        raise FileNotFoundError(f"config not found: {path}")
+
+    text = path.read_text()
+    data: Any
+    if path.suffix in (".yaml", ".yml"):
+        if not _HAS_YAML:
+            raise RuntimeError("PyYAML required to load YAML config. Install it or provide JSON config.")
+        data = yaml.safe_load(text)
+    else:
+        data = json.loads(text)
+
+    agents: List[AgentSpec] = []
+    for entry in data.get("agents", []):
+        agents.append(AgentSpec(
+            name=entry.get("name") or entry.get("id") or "agent",
+            type=entry.get("type", "noop"),
+            cmd=entry.get("cmd"),
+            retries=int(entry.get("retries", 0)),
+            timeout=(float(entry.get("timeout")) if entry.get("timeout") is not None else None),
+        ))
+    return agents
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Simple multi-agent runner (demo)")
+    p.add_argument("--config", "-c", type=Path, help="JSON/YAML config file with agents")
+    p.add_argument("--workers", "-w", type=int, default=4, help="Max concurrent agents")
+    p.add_argument("--json", dest="json_out", action="store_true", help="Print results as JSON")
+    return p.parse_args(argv)
+
+
+def _setup_logging() -> None:
+    h = logging.StreamHandler()
+    fmt = "%(asctime)s %(levelname)s %(message)s"
+    h.setFormatter(logging.Formatter(fmt))
+    LOG.addHandler(h)
+    LOG.setLevel(logging.INFO)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    _setup_logging()
+    args = parse_args(argv)
+    try:
+        agents = load_config(args.config) if args.config else load_config(None)
+    except Exception as e:
+        LOG.error("Failed to load config: %s", e)
+        return 2
+
+    runner = Runner(agents, max_workers=args.workers)
+
+    def _handle_sig(sig, frame):
+        LOG.info("Signal %s received: requesting stop", sig)
+        runner.stop()
+
+    signal.signal(signal.SIGINT, _handle_sig)
+    signal.signal(signal.SIGTERM, _handle_sig)
+
+    results = runner.run()
+    if args.json_out:
+        print(json.dumps(results))
+    else:
+        LOG.info("Run finished. Results: %s", results)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
