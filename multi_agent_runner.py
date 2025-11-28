@@ -1,211 +1,284 @@
 #!/usr/bin/env python3
-"""Simple, robust multi-agent runner
-
-Features implemented:
-- Load optional YAML/JSON config with agent definitions
-- Support two agent types: "noop" and "shell"
-- Run agents concurrently using ThreadPoolExecutor
-- Retry, timeout, and structured logging to stdout
-- Graceful shutdown on KeyboardInterrupt / SIGTERM
-
-Design goals: minimal dependencies (stdlib-first), clear errors,
-small interface, and easy extensibility.
 """
-from __future__ import annotations
+Multi-Agent System for Dr. Nomi Bhai (Veterinarian & Developer)
+This system utilizes the Google Agent Developer Kit (ADK) to route complex queries 
+to 14 specialized agents, ensuring full, free, and secure access within API limits.
+"""
 
-import argparse
-import json
-import logging
-import signal
-import subprocess
-import sys
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+import os
+import asyncio
+from google.adk.agents import Agent
+from google.adk.client import Client
+from google.adk.session import Session, InMemorySessionService
+from google.adk.tools import (
+    BuiltInCodeExecutor, 
+    GoogleSearch, 
+    UrlContext
+)
+from google.adk.schema import ToolCall
 
-# YAML support is optional; if PyYAML is available we'll use it for .yaml files
+# --- 0. Client Setup (Ensure API Key is loaded) ---
+# Assuming GEMINI_API_KEY is set in your codespace environment
 try:
-    import yaml  # type: ignore
-    _HAS_YAML = True
-except Exception:
-    _HAS_YAML = False
+    API_KEY = os.environ.get("GEMINI_API_KEY")
+    if not API_KEY:
+        print("WARNING: GEMINI_API_KEY environment variable not set.")
+    client = Client(api_key=API_KEY)
+except Exception as e:
+    print(f"Error initializing Gemini Client: {e}")
+    client = None
 
-LOG = logging.getLogger("multi_agent_runner")
-
-
-@dataclass
-class AgentSpec:
-    name: str
-    type: str
-    cmd: Optional[str] = None
-    retries: int = 0
-    timeout: Optional[float] = None
+# --- 1. Tool Definitions (Free and Functional) ---
+google_search = GoogleSearch()
+url_context = UrlContext()
+built_in_code_executor = BuiltInCodeExecutor()
 
 
-class Runner:
-    def __init__(self, agents: List[AgentSpec], max_workers: int = 4) -> None:
-        self.agents = agents
-        self.max_workers = max_workers
-        self._stop = threading.Event()
+# --- 2. Specialized Sub-Agent Definitions (13 Agents) ---
 
-    def stop(self) -> None:
-        LOG.info("Stop requested")
-        self._stop.set()
+# 2.1 Web Analysis & Summary
+url_context_agent = Agent(
+    model='gemini-2.5-flash',
+    name='UrlContextAgent',
+    instruction="Analyze the given URL content and summarize the key information concisely. Use the url_context tool.",
+    tools=[url_context],
+    client=client
+)
 
-    def run_agent(self, spec: AgentSpec) -> Dict[str, Any]:
-        LOG.info("Starting agent %s (type=%s)", spec.name, spec.type)
-        attempt = 0
-        last_exc: Optional[Exception] = None
-        while attempt <= spec.retries and not self._stop.is_set():
-            attempt += 1
-            start = time.time()
-            try:
-                if spec.type == "noop":
-                    LOG.debug("Agent %s noop (attempt %d)", spec.name, attempt)
-                    # quick deterministic sleep to simulate work
-                    time.sleep(0.01)
-                    return {"name": spec.name, "status": "ok", "attempts": attempt}
+# 2.2 Code Execution
+coding_agent = Agent(
+    model='gemini-2.5-flash',
+    name='CodeAgent',
+    instruction="Write, debug, and execute Python code. Use the built_in_code_executor tool for all execution requests.",
+    code_executor=built_in_code_executor,
+    client=client
+)
 
-                elif spec.type == "shell":
-                    if not spec.cmd:
-                        raise ValueError("shell agent requires 'cmd'")
-                    LOG.info("Agent %s running shell: %s", spec.name, spec.cmd)
-                    # Run shell command; use subprocess to capture output.
-                    proc = subprocess.Popen(spec.cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    try:
-                        out, err = proc.communicate(timeout=spec.timeout)
-                        rc = proc.returncode
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        out, err = proc.communicate()
-                        rc = -1
-                        raise TimeoutError(f"agent {spec.name} timed out")
+# 2.3 Veterinary Knowledge Base (Dr. Nomi Bhai's Core Focus)
+veterinary_kb_agent = Agent(
+    model='gemini-2.5-flash',
+    name='VeterinaryKBAgent',
+    instruction="""
+    You are an expert veterinarian assistant specializing in animal health, diseases, diagnosis, and common treatments. 
+    Use the Google Search tool to find reliable, up-to-date information on animal medical conditions. 
+    """,
+    tools=[google_search],
+    client=client
+)
 
-                    if rc != 0:
-                        stderr = err.decode(errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
-                        raise RuntimeError(f"agent {spec.name} failed rc={rc} err={stderr}")
+# 2.4 Creative Content Generation (Adobe Express simulation)
+creative_agent = Agent(
+    model='gemini-2.5-pro',
+    name='CreativeAgent',
+    instruction="""
+    You are an expert design and content strategist, simulating generative AI capabilities (like Adobe Express). 
+    Generate creative text, design ideas, social media captions, and visual concepts.
+    """,
+    tools=[google_search],
+    client=client
+)
 
-                    duration = time.time() - start
-                    stdout_text = out.decode(errors="ignore") if isinstance(out, (bytes, bytearray)) else str(out)
-                    LOG.debug("Agent %s stdout: %s", spec.name, stdout_text)
-                    LOG.info("Agent %s succeeded in %.3fs", spec.name, duration)
-                    return {"name": spec.name, "status": "ok", "attempts": attempt, "duration": duration}
+# 2.5 Network Security & Ethical Hacking (Nmap, Aircrack-ng)
+net_sec_agent = Agent(
+    model='gemini-2.5-flash',
+    name='NetSecAgent',
+    instruction="""
+    You are an expert in ethical hacking and network security, focusing on **free and open-source tools** like Nmap, Metasploit, Aircrack-ng, Kismet, and Wifite for auditing. 
+    Answer security questions responsibly and ethically.
+    """,
+    tools=[google_search],
+    client=client
+)
 
-                else:
-                    raise ValueError(f"unsupported agent type: {spec.type}")
+# 2.6 System Security (Windows & Android Layers)
+system_security_agent = Agent(
+    model='gemini-2.5-flash',
+    name='SystemSecurityAgent',
+    instruction="""
+    You are an expert in system security, specializing in defense layers of Windows (UAC, BitLocker) and Android (Sandbox, SELinux). 
+    Provide advice on OS security features and patching.
+    """,
+    tools=[google_search],
+    client=client
+)
 
-            except Exception as exc:  # capture any failure to allow retries
-                last_exc = exc
-                LOG.warning("Agent %s attempt %d failed: %s", spec.name, attempt, exc)
-                if attempt > spec.retries:
-                    break
-                LOG.info("Retrying agent %s (next attempt %d/%d)", spec.name, attempt + 1, spec.retries + 1)
-                # small backoff
-                time.sleep(0.05)
+# 2.7 Remote Access and Administration (SSH, VPN)
+remote_access_agent = Agent(
+    model='gemini-2.5-flash',
+    name='RemoteAccessAgent',
+    instruction="""
+    You are an expert in remote access technologies (SSH, VPN, TeamViewer, RDP) and system administration. 
+    Provide setup guides and security best practices for remote management.
+    """,
+    tools=[google_search],
+    client=client
+)
 
-        return {"name": spec.name, "status": "failed", "error": str(last_exc), "attempts": attempt}
+# 2.8 Remote Monitoring and Environment Control (Camera/Mic, Smart Sensors)
+monitoring_agent = Agent(
+    model='gemini-2.5-flash',
+    name='MonitoringAgent',
+    instruction="""
+    You are an expert in remote surveillance and environment control systems, focusing on IP cameras, smart sensors, and secure access methods (MDM).
+    """,
+    tools=[google_search],
+    client=client
+)
 
-    def run(self) -> List[Dict[str, Any]]:
-        results: List[Dict[str, Any]] = []
-        LOG.info("Running %d agents with up to %d workers", len(self.agents), self.max_workers)
-        if not self.agents:
-            LOG.info("No agents to run")
-            return results
+# 2.9 Subscription Management and Fraud Prevention
+subscription_agent = Agent(
+    model='gemini-2.5-flash',
+    name='SubscriptionAgent',
+    instruction="""
+    You are an expert in mobile app monetization, subscription management, and fraud detection. 
+    Provide guidance on using SDKs (RevenueCat, Adapty) and secure server-side receipt validation.
+    """,
+    tools=[google_search],
+    client=client
+)
 
-        max_workers = min(self.max_workers, max(1, len(self.agents)))
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {ex.submit(self.run_agent, a): a for a in self.agents}
-            try:
-                for fut in as_completed(futures):
-                    try:
-                        res = fut.result()
-                    except Exception as exc:
-                        LOG.exception("Unhandled exception in agent future: %s", exc)
-                        res = {"name": "unknown", "status": "failed", "error": str(exc)}
-                    LOG.info("Agent result: %s", res)
-                    results.append(res)
-                    if self._stop.is_set():
-                        LOG.info("Stop flag set; breaking out of result loop")
-                        break
-            except KeyboardInterrupt:
-                LOG.info("KeyboardInterrupt received; requesting stop")
-                self.stop()
-        return results
+# 2.10 RF Signal Analysis and Spectrum Monitoring
+rf_spy_agent = Agent(
+    model='gemini-2.5-flash',
+    name='RFSpyAgent',
+    instruction="""
+    You are an expert in Radio Frequency (RF) analysis and spectrum monitoring. 
+    Focus on open-source tools like RTL-SDR, GNU Radio, and Wireshark for catching and describing various wireless signals.
+    """,
+    tools=[google_search],
+    client=client
+)
 
+# 2.11 Digital Media Decoding
+digital_media_agent = Agent(
+    model='gemini-2.5-flash',
+    name='DigitalMediaAgent',
+    instruction="""
+    You are an expert in digital media communications, specializing in signal reception, decoding (DVB/ATSC), and content security analysis using tools like VLC and SDR.
+    """,
+    tools=[google_search],
+    client=client
+)
 
-def load_config(path: Optional[Path]) -> List[AgentSpec]:
-    if not path:
-        LOG.info("No config provided; using two default noop agents for demo")
-        return [AgentSpec(name="demo-noop-1", type="noop"), AgentSpec(name="demo-noop-2", type="noop")]
+# 2.12 Polymorphic Security & Optimization (Metasploit, Prometheus)
+poly_agent = Agent(
+    model='gemini-2.5-flash',
+    name='PolyAgent',
+    instruction="""
+    You are an expert in advanced cybersecurity, Polymorphic code, SDR research, self-security auditing (e.g., Lynis), and performance optimization (e.g., Prometheus/Grafana). 
+    Provide guidance on building robust, self-optimizing systems.
+    """,
+    tools=[google_search],
+    client=client
+)
 
-    if not path.exists():
-        raise FileNotFoundError(f"config not found: {path}")
+# --- 3. The Autonomous Manager (PlannerAgent) ---
+planner_agent = Agent(
+    model='gemini-2.5-pro', 
+    name='PlannerAgent',
+    instruction="""
+    You are the strategic task planner and autonomous manager. Your role is to decompose complex, multi-step user requests into smaller, sequential, and manageable sub-tasks. 
+    You must then delegate each sub-task to the ONE most appropriate specialized agent (from the sub_agents list) to ensure a complete and accurate final answer. 
+    Always prioritize the correct specialized agent for the task.
+    """,
+    # Planner can use the code executor for complex internal logic/planning verification
+    code_executor=built_in_code_executor, 
+    client=client
+)
 
-    text = path.read_text()
-    data: Any
-    if path.suffix in (".yaml", ".yml"):
-        if not _HAS_YAML:
-            raise RuntimeError("PyYAML required to load YAML config. Install it or provide JSON config.")
-        data = yaml.safe_load(text)
+# --- 4. The Root Agent (The Router) ---
+root_agent = Agent(
+    name="RootAgent",
+    model="gemini-2.5-flash",
+    description="Main Router Agent. Route complex queries to the PlannerAgent for decomposition. Route simple, specialized queries directly to the appropriate sub-agent.",
+    sub_agents=[
+        planner_agent,             # 1. PlannerAgent (First and most important for complex routing)
+        url_context_agent,         # 2. URL/Web Context
+        coding_agent,              # 3. Code Execution
+        veterinary_kb_agent,       # 4. Veterinary
+        creative_agent,            # 5. Creative Content
+        net_sec_agent,             # 6. Network Security
+        system_security_agent,     # 7. OS Security
+        remote_access_agent,       # 8. Remote Access
+        monitoring_agent,          # 9. Monitoring/Surveillance
+        subscription_agent,        # 10. Subscription Fraud
+        rf_spy_agent,              # 11. RF Analysis
+        digital_media_agent,       # 12. Digital Media Decoding
+        poly_agent,                # 13. Polymorphic Security/Optimization
+    ],
+    client=client
+)
+
+# --- 5. Execution Logic ---
+async def call_agent_async(query: str, session: Session):
+    """Asynchronously sends a query to the RootAgent and prints the response."""
+    print(f"\n[User Query] -> {query}")
+    
+    # Send the query to the RootAgent
+    response = await session.send_message_async(query)
+
+    # Print the final response and the sub-agent/tool calls
+    print("\n--- [Agent Output] ---")
+    
+    # Check if any tool or sub-agent was called
+    if response.tool_calls:
+        print("-> Tool Calls/Routing:")
+        for tool_call in response.tool_calls:
+            if isinstance(tool_call, ToolCall):
+                print(f"  - Agent Routed To: {tool_call.function.name}")
+            else:
+                print(f"  - Tool Called: {tool_call.function.name}")
     else:
-        data = json.loads(text)
+        print("-> Routing: Handled directly by RootAgent (simple query)")
+        
+    print(f"\n[Final Answer]:\n{response.text}")
+    print("----------------------")
+    return response.text
 
-    agents: List[AgentSpec] = []
-    for entry in data.get("agents", []):
-        agents.append(AgentSpec(
-            name=entry.get("name") or entry.get("id") or "agent",
-            type=entry.get("type", "noop"),
-            cmd=entry.get("cmd"),
-            retries=int(entry.get("retries", 0)),
-            timeout=(float(entry.get("timeout")) if entry.get("timeout") is not None else None),
-        ))
-    return agents
+async def main():
+    """Sets up the session and runs the test queries."""
+    if client is None:
+        print("\nFATAL: Gemini Client not initialized. Exiting.")
+        return
 
+    # Initialize a new session service (in-memory for this script)
+    session_service = InMemorySessionService()
+    # Create a new session with the configured RootAgent
+    session = await session_service.create_session_async(root_agent)
+    
+    print("--- Multi-Agent System Initialized (14 Agents) ---")
+    print(f"Root Agent Model: {root_agent.model}")
+    print(f"Sub-Agents Count: {len(root_agent.sub_agents)}")
+    print("-------------------------------------------------")
+    
+    # Test queries designed to hit various agents, including the Planner
+    test_queries = [
+        "What is the capital city of Pakistan?", # 1. Simple, handled by RootAgent
+        "Write a Python script to calculate the factorial of number 7 and execute it.", # 2. CodeAgent
+        "What are the common symptoms and initial treatment for Parvovirus in puppies?", # 3. VeterinaryKBAgent
+        "First, summarize the article at https://en.wikipedia.org/wiki/Veterinary_medicine, and then run a Python script to print the word 'Veterinarian'.", # 4. PlannerAgent (Multi-step)
+        "How is the open-source tool Aircrack-ng ethically used by security professionals to test WiFi security?", # 5. NetSecAgent
+        "What are the security best practices for setting up SSH access through a gateway server?", # 6. RemoteAccessAgent
+        "Suggest three creative concepts for a social media campaign promoting a free Parvovirus screening camp.", # 7. CreativeAgent
+        "Explain the purpose of BitLocker and how it protects data on a Windows system.", # 8. SystemSecurityAgent
+        "What are the advantages of using smart motion sensors alongside IP cameras for home security?", # 9. MonitoringAgent
+        "Provide guidance on using server-side receipt validation to prevent subscription fraud in mobile apps.", # 10. SubscriptionAgent
+        "How can I use an RTL-SDR dongle and GNU Radio to capture and analyze FM radio signals?", # 11. RFSpyAgent
+        "Describe how the VLC player can be used to decode DVB-T streams for analysis.", # 12. DigitalMediaAgent
+        "Explain how the Lynis tool can improve self-security auditing on a Linux system.", # 13. PolyAgent
+    ]
+    
+    for query in test_queries:
+        await call_agent_async(query, session)
+        
+    print("\n--- ALL TESTS COMPLETE ---")
 
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Simple multi-agent runner (demo)")
-    p.add_argument("--config", "-c", type=Path, help="JSON/YAML config file with agents")
-    p.add_argument("--workers", "-w", type=int, default=4, help="Max concurrent agents")
-    p.add_argument("--json", dest="json_out", action="store_true", help="Print results as JSON")
-    return p.parse_args(argv)
-
-
-def _setup_logging() -> None:
-    h = logging.StreamHandler()
-    fmt = "%(asctime)s %(levelname)s %(message)s"
-    h.setFormatter(logging.Formatter(fmt))
-    LOG.addHandler(h)
-    LOG.setLevel(logging.INFO)
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    _setup_logging()
-    args = parse_args(argv)
+if __name__ == '__main__':
+    # Execute the main function asynchronously
     try:
-        agents = load_config(args.config) if args.config else load_config(None)
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nScript terminated by user.")
     except Exception as e:
-        LOG.error("Failed to load config: %s", e)
-        return 2
+        print(f"\nAn unexpected error occurred: {e}")
 
-    runner = Runner(agents, max_workers=args.workers)
-
-    def _handle_sig(sig, frame):
-        LOG.info("Signal %s received: requesting stop", sig)
-        runner.stop()
-
-    signal.signal(signal.SIGINT, _handle_sig)
-    signal.signal(signal.SIGTERM, _handle_sig)
-
-    results = runner.run()
-    if args.json_out:
-        print(json.dumps(results))
-    else:
-        LOG.info("Run finished. Results: %s", results)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
